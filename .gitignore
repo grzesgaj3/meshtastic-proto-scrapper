@@ -3,5 +3,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 readings.jsonl
+messages.jsonl
 state.json
 *.tmp

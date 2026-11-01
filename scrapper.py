@@ -42,6 +42,18 @@ def build_record(text, rx_time=None, now=None):
     return {"timestamp": iso_utc(int(timestamp)), **reading}
 
 
+def build_message(packet, text):
+    """Build a raw record for every text message received from the mesh."""
+    timestamp = packet.get("rxTime") or time.time()
+    return {
+        "timestamp": iso_utc(int(timestamp)),
+        "from": packet.get("fromId", packet.get("from")),
+        "channel": packet.get("channel", 0),
+        "packet_id": packet.get("id"),
+        "text": text,
+    }
+
+
 def append_record(path, record):
     """Append one JSON record as a line, flushing it to disk immediately."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -156,19 +168,23 @@ class SeenPackets:
         return True
 
 
-def on_receive(packet, interface=None, *, readings_path, seen):
-    """Pubsub handler: turn a received mesh text packet into a JSON line."""
+def on_receive(packet, interface=None, *, readings_path, messages_path, seen):
+    """Pubsub handler: save every mesh text and also parse sensor readings."""
     decoded = packet.get("decoded")
     text = decoded.get("text") if isinstance(decoded, dict) else None
-    record = build_record(text or "", packet.get("rxTime"))
-    if record is None:
-        if text:
-            log.debug("Pomijam wiadomość bez odczytu: %r", text)
+    if not text:
         return
 
     key = (packet.get("from"), packet.get("id"))
     if key[1] is not None and not seen.add(key):
         log.debug("Pomijam duplikat pakietu id=%s", key[1])
+        return
+
+    append_record(messages_path, build_message(packet, text))
+
+    record = build_record(text, packet.get("rxTime"))
+    if record is None:
+        log.debug("Zapisano wiadomość bez odczytu: %r", text)
         return
 
     append_record(readings_path, record)
@@ -180,12 +196,18 @@ def on_receive(packet, interface=None, *, readings_path, seen):
     )
 
 
-def make_handler(readings_path, seen):
+def make_handler(readings_path, messages_path, seen):
     """Wrap :func:`on_receive` in a plain two-arg pubsub listener."""
 
     def handler(packet, interface=None):
         try:
-            on_receive(packet, interface, readings_path=readings_path, seen=seen)
+            on_receive(
+                packet,
+                interface,
+                readings_path=readings_path,
+                messages_path=messages_path,
+                seen=seen,
+            )
         except Exception:  # noqa: BLE001 - never kill the radio reader thread
             log.exception("Błąd przetwarzania pakietu")
 
@@ -245,6 +267,12 @@ def parse_args(argv=None):
         help="plik, do którego dopisujemy odczyty (JSONL)",
     )
     parser.add_argument(
+        "--messages-file",
+        type=Path,
+        default=Path(os.environ.get("MESSAGES_FILE", BASE_DIR / "messages.jsonl")),
+        help="plik, do którego zapisujemy każdą odebraną wiadomość (JSONL)",
+    )
+    parser.add_argument(
         "--commands-file",
         type=Path,
         default=Path(os.environ.get("COMMANDS_FILE", BASE_DIR / "commands.json")),
@@ -266,15 +294,16 @@ def run(args):
 
     seen = SeenPackets()
     stop_event = threading.Event()
-    handler = make_handler(args.readings_file, seen)
+    handler = make_handler(args.readings_file, args.messages_file, seen)
     pub.subscribe(handler, "meshtastic.receive.text")
 
     log.info(
-        "Start: port=%s kanał=%d sensor=%s odczyty=%s komendy=%s",
+        "Start: port=%s kanał=%d sensor=%s odczyty=%s wiadomości=%s komendy=%s",
         args.port,
         args.channel,
         args.sensor,
         args.readings_file,
+        args.messages_file,
         args.commands_file,
     )
     try:

@@ -4,9 +4,10 @@ Mostek między radiem Meshtastic podłączonym po serialu a plikami, które udaj
 
 Skrypt działa w jednej pętli i robi dwie rzeczy:
 
-1. **Mesh → `readings.jsonl`** — nasłuchuje tekstowych wiadomości z mesha,
-   parsuje `sensor1: <przechylenia>;<mm>` i dopisuje każdy odczyt jako jedną
-   linię JSON. Czas bierze z metadanych pakietu (`rxTime`), nie z treści.
+1. **Mesh → pliki** — nasłuchuje tekstowych wiadomości z mesha. Każdą odebraną
+   wiadomość zapisuje w `messages.jsonl`, a dodatkowo te w formacie
+   `sensor1: <przechylenia>;<mm>` trafiają jako odczyt do `readings.jsonl`.
+   Czas bierze z metadanych pakietu (`rxTime`), nie z treści.
 2. **`commands.json` → mesh** — co kilka sekund sprawdza plik z komendami i dla
    każdej nowej komendy wysyła na kanał główny `sensor1;<komenda>\n`.
 
@@ -52,6 +53,7 @@ odpowiednik w zmiennej środowiskowej):
 | `--poll-interval` | `POLL_INTERVAL` | `5` s |
 | `--reconnect-delay` | `RECONNECT_DELAY` | `5` s |
 | `--readings-file` | `READINGS_FILE` | `readings.jsonl` |
+| `--messages-file` | `MESSAGES_FILE` | `messages.jsonl` |
 | `--commands-file` | `COMMANDS_FILE` | `commands.json` |
 | `--state-file` | `STATE_FILE` | `state.json` |
 
@@ -60,9 +62,21 @@ radia skrypt próbuje połączyć się ponownie.
 
 ## Format danych
 
+### Wszystkie wiadomości — `messages.jsonl`
+
+Każda odebrana wiadomość tekstowa, niezależnie od treści:
+
+```json
+{"timestamp": "2026-10-30T12:34:56Z", "from": "!28b54624", "channel": 0, "packet_id": 589440320, "text": "sensor1;123"}
+```
+
+`from` to ID węzła (`fromId`), a gdy go brakuje — numer węzła. Duplikaty tego
+samego pakietu są pomijane.
+
 ### Odczyty — `readings.jsonl`
 
-Jedna linia = jedno symulowane ciało POST-a:
+Tylko wiadomości pasujące do `sensor1: <liczba>;<mm>`. Jedna linia = jedno
+symulowane ciało POST-a:
 
 ```json
 {"timestamp": "2026-10-30T12:34:56Z", "sensor": "sensor1", "tilts": 1234, "rain_mm": 20.0}
@@ -95,7 +109,8 @@ samą komendę, nadaj jej nowe `id`.
 
 Miejsca do zmiany:
 
-- `append_record()` — zamiast dopisywać linię, zrób `POST` z rekordem.
+- `append_record()` — zamiast dopisywać linię, zrób `POST` z rekordem
+  (dotyczy zarówno `messages.jsonl`, jak i `readings.jsonl`).
 - `load_commands()` — zamiast czytać plik, pobierz komendy z API.
 - `save_state()` / `load_state()` — oznaczanie komend jako wysłanych po stronie API.
 

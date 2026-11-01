@@ -121,52 +121,89 @@ def test_poll_commands_sends_unsent_commands_once(tmp_path):
     assert len(radio.sent) == 2
 
 
-def test_receive_appends_record_with_mesh_time(tmp_path):
-    path = tmp_path / "readings.jsonl"
+def test_receive_appends_reading_with_mesh_time(tmp_path):
+    readings = tmp_path / "readings.jsonl"
+    messages = tmp_path / "messages.jsonl"
     packet = {
         "from": 123,
         "id": 7,
         "rxTime": 1690000000,
+        "channel": 0,
+        "fromId": "!0000007b",
         "decoded": {"text": "sensor1: 3;1.5"},
     }
 
-    scrapper.on_receive(packet, None, readings_path=path, seen=scrapper.SeenPackets())
+    scrapper.on_receive(
+        packet,
+        None,
+        readings_path=readings,
+        messages_path=messages,
+        seen=scrapper.SeenPackets(),
+    )
 
-    assert json.loads(path.read_text()) == {
+    assert json.loads(readings.read_text()) == {
         "timestamp": "2023-07-22T04:26:40Z",
         "sensor": "sensor1",
         "tilts": 3,
         "rain_mm": 1.5,
     }
+    assert json.loads(messages.read_text()) == {
+        "timestamp": "2023-07-22T04:26:40Z",
+        "from": "!0000007b",
+        "channel": 0,
+        "packet_id": 7,
+        "text": "sensor1: 3;1.5",
+    }
+
+
+def test_receive_saves_message_that_is_not_a_reading(tmp_path):
+    readings = tmp_path / "readings.jsonl"
+    messages = tmp_path / "messages.jsonl"
+    packet = {"from": 9, "id": 8, "rxTime": 1690000000, "decoded": {"text": "sensor1;123"}}
+
+    scrapper.on_receive(
+        packet,
+        None,
+        readings_path=readings,
+        messages_path=messages,
+        seen=scrapper.SeenPackets(),
+    )
+
+    saved = json.loads(messages.read_text())
+    assert saved["text"] == "sensor1;123"
+    assert saved["from"] == 9
+    assert saved["channel"] == 0
+    assert not readings.exists()
 
 
 def test_receive_ignores_duplicate_packet(tmp_path):
-    path = tmp_path / "readings.jsonl"
+    readings = tmp_path / "readings.jsonl"
+    messages = tmp_path / "messages.jsonl"
     seen = scrapper.SeenPackets()
     packet = {"from": 123, "id": 7, "rxTime": 1690000000, "decoded": {"text": "sensor1: 3;1.5"}}
 
-    scrapper.on_receive(packet, None, readings_path=path, seen=seen)
-    scrapper.on_receive(packet, None, readings_path=path, seen=seen)
+    scrapper.on_receive(packet, None, readings_path=readings, messages_path=messages, seen=seen)
+    scrapper.on_receive(packet, None, readings_path=readings, messages_path=messages, seen=seen)
 
-    assert len(path.read_text().splitlines()) == 1
-
-
-def test_receive_ignores_unrelated_text(tmp_path):
-    path = tmp_path / "readings.jsonl"
-    packet = {"from": 123, "id": 8, "rxTime": 1690000000, "decoded": {"text": "hello mesh"}}
-
-    scrapper.on_receive(packet, None, readings_path=path, seen=scrapper.SeenPackets())
-
-    assert not path.exists()
+    assert len(readings.read_text().splitlines()) == 1
+    assert len(messages.read_text().splitlines()) == 1
 
 
 def test_receive_ignores_packet_without_text(tmp_path):
-    path = tmp_path / "readings.jsonl"
+    readings = tmp_path / "readings.jsonl"
+    messages = tmp_path / "messages.jsonl"
     packet = {"from": 123, "id": 9, "rxTime": 1690000000}
 
-    scrapper.on_receive(packet, None, readings_path=path, seen=scrapper.SeenPackets())
+    scrapper.on_receive(
+        packet,
+        None,
+        readings_path=readings,
+        messages_path=messages,
+        seen=scrapper.SeenPackets(),
+    )
 
-    assert not path.exists()
+    assert not readings.exists()
+    assert not messages.exists()
 
 
 class FakeStop:
@@ -231,7 +268,8 @@ def test_pubsub_handler_delivers_packet(tmp_path):
     from pubsub import pub
 
     path = tmp_path / "readings.jsonl"
-    handler = scrapper.make_handler(path, scrapper.SeenPackets())
+    messages = tmp_path / "messages.jsonl"
+    handler = scrapper.make_handler(path, messages, scrapper.SeenPackets())
     pub.subscribe(handler, "test.meshtastic.receive.text")
     try:
         pub.sendMessage(
@@ -255,7 +293,11 @@ def test_handler_survives_storage_error(tmp_path, monkeypatch):
         raise OSError("brak miejsca")
 
     monkeypatch.setattr(scrapper, "append_record", broken_append)
-    handler = scrapper.make_handler(tmp_path / "readings.jsonl", scrapper.SeenPackets())
+    handler = scrapper.make_handler(
+        tmp_path / "readings.jsonl",
+        tmp_path / "messages.jsonl",
+        scrapper.SeenPackets(),
+    )
 
     handler(
         {"from": 1, "id": 2, "rxTime": 1690000000, "decoded": {"text": "sensor1: 1;0.2"}},
