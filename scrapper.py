@@ -1,4 +1,4 @@
-"""Mostek między Meshtastic (serial/protobuf) a symulowanym API w plikach."""
+"""Mostek między Meshtastic (serial/protobuf) a API RainGauge."""
 
 import json
 import logging
@@ -6,12 +6,16 @@ import os
 import re
 import threading
 import time
+import urllib.request
 from argparse import ArgumentParser
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
 READING_RE = re.compile(r"^\s*([^:;]+?)\s*:\s*(\d+)\s*;\s*(\d+(?:\.\d+)?)\s*$")
+
+API_TIMEOUT = 5
+CLEAN_COMMAND = "c"
 
 log = logging.getLogger("scrapper")
 
@@ -68,86 +72,57 @@ def format_command(sensor, command):
     return f"{sensor};{command}\n"
 
 
-def load_commands(path):
-    """Read the simulated API command queue, ignoring anything malformed."""
+def api_get_json(url, *, opener=urllib.request.urlopen, timeout=API_TIMEOUT):
+    """Fetch and decode one JSON response from the API."""
+    with opener(url, timeout=timeout) as response:
+        return json.load(response)
+
+
+def upload_reading(api_url, record, *, opener=urllib.request.urlopen, timeout=API_TIMEOUT):
+    """POST one reading to the API; failures are logged, not raised."""
+    body = json.dumps(
+        {
+            "millimeters": record["rain_mm"],
+            "deviceTimestamp": record["timestamp"],
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{api_url.rstrip('/')}/api/Device/upload",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
     try:
-        with open(path, encoding="utf-8") as handle:
-            data = json.load(handle)
-    except FileNotFoundError:
-        return []
-    except (OSError, json.JSONDecodeError) as exc:
-        log.warning("Nie mogę odczytać %s: %s", path, exc)
-        return []
-    if not isinstance(data, list):
-        log.warning("%s powinien zawierać listę komend", path)
-        return []
-    commands = []
-    for entry in data:
-        if not isinstance(entry, dict):
-            continue
-        command = entry.get("command")
-        command_id = entry.get("id")
-        if isinstance(command_id, bool) or not isinstance(command_id, (int, str)):
-            continue
-        if not isinstance(command, str) or not command.strip():
-            continue
-        commands.append({"id": command_id, "command": command.strip()})
-    return commands
+        with opener(request, timeout=timeout) as response:
+            response.read()
+    except OSError as exc:
+        log.warning("Nie mogę wysłać odczytu do API: %s", exc)
+        return False
+    log.info("Wysłano odczyt do API: %.1f mm", record["rain_mm"])
+    return True
 
 
-def pending_commands(commands, sent_ids):
-    """Return commands whose id has not been sent yet."""
-    sent = set(sent_ids)
-    return [command for command in commands if command["id"] not in sent]
-
-
-def load_state(path):
-    """Load the sent-command state, falling back to an empty state."""
+def poll_commands(radio, api_url, sensor, channel=0, *, opener=urllib.request.urlopen):
+    """Send the cleaning command when the API reports one as pending."""
+    base = api_url.rstrip("/")
     try:
-        with open(path, encoding="utf-8") as handle:
-            data = json.load(handle)
-    except FileNotFoundError:
-        return {"sent_ids": []}
-    except (OSError, json.JSONDecodeError) as exc:
-        log.warning("Nie mogę odczytać %s: %s", path, exc)
-        return {"sent_ids": []}
-    sent_ids = data.get("sent_ids") if isinstance(data, dict) else None
-    if not isinstance(sent_ids, list):
-        return {"sent_ids": []}
-    return {"sent_ids": sent_ids}
-
-
-def save_state(path, state):
-    """Write state atomically so a crash cannot leave it half-written."""
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    temporary = f"{path}.tmp"
-    with open(temporary, "w", encoding="utf-8") as handle:
-        json.dump(state, handle)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
-
-
-def poll_commands(radio, commands_path, state_path, sensor, channel=0):
-    """Send every not-yet-sent command from the queue and remember it."""
-    commands = load_commands(commands_path)
-    if not commands:
+        status = api_get_json(f"{base}/api/Device/clean-status", opener=opener)
+    except (OSError, ValueError) as exc:
+        log.warning("Nie mogę odczytać statusu czyszczenia: %s", exc)
         return 0
-    state = load_state(state_path)
-    sent_ids = state["sent_ids"]
-    sent = set(sent_ids)
-    sent_count = 0
-    for command in pending_commands(commands, sent):
-        radio.sendText(
-            format_command(sensor, command["command"]),
-            channelIndex=channel,
-        )
-        sent.add(command["id"])
-        sent_ids.append(command["id"])
-        save_state(state_path, {"sent_ids": sent_ids})
-        sent_count += 1
-        log.info("Wysłano komendę id=%s: %r", command["id"], command["command"])
-    return sent_count
+    if not isinstance(status, dict) or not status.get("isPending"):
+        return 0
+    try:
+        radio.sendText(format_command(sensor, CLEAN_COMMAND), channelIndex=channel)
+    except Exception as exc:  # noqa: BLE001 - radio failures must not kill polling
+        log.warning("Nie mogę wysłać komendy czyszczenia: %s", exc)
+        return 0
+    try:
+        api_get_json(f"{base}/api/Device/commands", opener=opener)
+    except (OSError, ValueError) as exc:
+        log.warning("Nie mogę potwierdzić komendy czyszczenia: %s", exc)
+    log.info("Wysłano komendę czyszczenia %r", CLEAN_COMMAND)
+    return 1
 
 
 class SeenPackets:
@@ -168,7 +143,7 @@ class SeenPackets:
         return True
 
 
-def on_receive(packet, interface=None, *, readings_path, messages_path, seen):
+def on_receive(packet, interface=None, *, readings_path, messages_path, seen, api_url=None):
     """Pubsub handler: save every mesh text and also parse sensor readings."""
     decoded = packet.get("decoded")
     text = decoded.get("text") if isinstance(decoded, dict) else None
@@ -188,6 +163,8 @@ def on_receive(packet, interface=None, *, readings_path, messages_path, seen):
         return
 
     append_record(readings_path, record)
+    if api_url:
+        upload_reading(api_url, record)
     log.info(
         "Odczyt: %s przechyleń, %.1f mm (pakiet id=%s)",
         record["tilts"],
@@ -196,7 +173,7 @@ def on_receive(packet, interface=None, *, readings_path, messages_path, seen):
     )
 
 
-def make_handler(readings_path, messages_path, seen):
+def make_handler(readings_path, messages_path, seen, api_url=None):
     """Wrap :func:`on_receive` in a plain two-arg pubsub listener."""
 
     def handler(packet, interface=None):
@@ -207,6 +184,7 @@ def make_handler(readings_path, messages_path, seen):
                 readings_path=readings_path,
                 messages_path=messages_path,
                 seen=seen,
+                api_url=api_url,
             )
         except Exception:  # noqa: BLE001 - never kill the radio reader thread
             log.exception("Błąd przetwarzania pakietu")
@@ -220,10 +198,10 @@ def is_connected(interface):
     return state.is_set() if hasattr(state, "is_set") else bool(state)
 
 
-def serve(interface, *, commands_path, state_path, sensor, channel, poll_interval, stop_event):
-    """Poll the command queue while the radio stays connected."""
+def serve(interface, *, api_url, sensor, channel, poll_interval, stop_event):
+    """Poll the API for commands while the radio stays connected."""
     while is_connected(interface) and not stop_event.is_set():
-        poll_commands(interface, commands_path, state_path, sensor, channel)
+        poll_commands(interface, api_url, sensor, channel)
         stop_event.wait(poll_interval)
 
 
@@ -231,7 +209,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 
 def parse_args(argv=None):
-    parser = ArgumentParser(description="Mostek Meshtastic <-> plikowe API")
+    parser = ArgumentParser(description="Mostek Meshtastic <-> API RainGauge")
     parser.add_argument(
         "--port",
         default=os.environ.get("MESHTASTIC_PORT", "/dev/ttyUSB0"),
@@ -249,10 +227,15 @@ def parse_args(argv=None):
         help="nazwa sensora w wysyłanych komendach",
     )
     parser.add_argument(
+        "--api-url",
+        default=os.environ.get("API_URL", "http://127.0.0.1:8080"),
+        help="adres API deszczomierza (domyślnie http://127.0.0.1:8080)",
+    )
+    parser.add_argument(
         "--poll-interval",
         type=float,
         default=float(os.environ.get("POLL_INTERVAL", "5")),
-        help="co ile sekund czytać plik komend",
+        help="co ile sekund pytać API o komendy",
     )
     parser.add_argument(
         "--reconnect-delay",
@@ -272,18 +255,6 @@ def parse_args(argv=None):
         default=Path(os.environ.get("MESSAGES_FILE", BASE_DIR / "messages.jsonl")),
         help="plik, do którego zapisujemy każdą odebraną wiadomość (JSONL)",
     )
-    parser.add_argument(
-        "--commands-file",
-        type=Path,
-        default=Path(os.environ.get("COMMANDS_FILE", BASE_DIR / "commands.json")),
-        help="plik z komendami do wysłania",
-    )
-    parser.add_argument(
-        "--state-file",
-        type=Path,
-        default=Path(os.environ.get("STATE_FILE", BASE_DIR / "state.json")),
-        help="plik z id już wysłanych komend",
-    )
     return parser.parse_args(argv)
 
 
@@ -294,17 +265,17 @@ def run(args):
 
     seen = SeenPackets()
     stop_event = threading.Event()
-    handler = make_handler(args.readings_file, args.messages_file, seen)
+    handler = make_handler(args.readings_file, args.messages_file, seen, args.api_url)
     pub.subscribe(handler, "meshtastic.receive.text")
 
     log.info(
-        "Start: port=%s kanał=%d sensor=%s odczyty=%s wiadomości=%s komendy=%s",
+        "Start: port=%s kanał=%d sensor=%s api=%s odczyty=%s wiadomości=%s",
         args.port,
         args.channel,
         args.sensor,
+        args.api_url,
         args.readings_file,
         args.messages_file,
-        args.commands_file,
     )
     try:
         while not stop_event.is_set():
@@ -314,8 +285,7 @@ def run(args):
                 log.info("Połączono z radiem")
                 serve(
                     interface,
-                    commands_path=args.commands_file,
-                    state_path=args.state_file,
+                    api_url=args.api_url,
                     sensor=args.sensor,
                     channel=args.channel,
                     poll_interval=args.poll_interval,

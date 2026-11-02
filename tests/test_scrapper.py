@@ -67,32 +67,43 @@ def test_format_command():
     assert scrapper.format_command("sensor1", "reset") == "sensor1;reset\n"
 
 
-def test_load_commands_missing_file(tmp_path):
-    assert scrapper.load_commands(tmp_path / "missing.json") == []
+READING = {
+    "timestamp": "2023-07-22T04:26:40Z",
+    "sensor": "sensor1",
+    "tilts": 3,
+    "rain_mm": 1.5,
+}
 
 
-def test_load_commands_invalid_json(tmp_path):
-    path = tmp_path / "commands.json"
-    path.write_text("{not json")
-    assert scrapper.load_commands(path) == []
+class FakeResponse:
+    def __init__(self, payload):
+        self.payload = json.dumps(payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self.payload
 
 
-def test_load_commands_skips_invalid_entries(tmp_path):
-    path = tmp_path / "commands.json"
-    path.write_text(json.dumps([{"id": 1, "command": "a"}, {"id": 2}, {"command": "b"}, "x"]))
-    assert scrapper.load_commands(path) == [{"id": 1, "command": "a"}]
+class FakeOpener:
+    """Stand-in for urllib.request.urlopen; records calls and returns payloads."""
 
+    def __init__(self, *payloads):
+        self.payloads = list(payloads)
+        self.calls = []
 
-def test_pending_commands_skips_already_sent():
-    commands = [{"id": 1, "command": "a"}, {"id": 2, "command": "b"}]
-    assert scrapper.pending_commands(commands, {1}) == [{"id": 2, "command": "b"}]
+    def __call__(self, request, timeout=None):
+        self.calls.append(request)
+        payload = self.payloads.pop(0) if self.payloads else {}
+        return FakeResponse(payload)
 
-
-def test_state_round_trip(tmp_path):
-    path = tmp_path / "state.json"
-    assert scrapper.load_state(path) == {"sent_ids": []}
-    scrapper.save_state(path, {"sent_ids": [1, 2]})
-    assert scrapper.load_state(path) == {"sent_ids": [1, 2]}
+    @property
+    def urls(self):
+        return [call.full_url if hasattr(call, "full_url") else call for call in self.calls]
 
 
 class FakeRadio:
@@ -105,20 +116,79 @@ class FakeRadio:
         self.sent.append((text, channelIndex))
 
 
-def test_poll_commands_sends_unsent_commands_once(tmp_path):
-    commands_path = tmp_path / "commands.json"
-    state_path = tmp_path / "state.json"
-    commands_path.write_text(
-        json.dumps([{"id": 1, "command": "reset"}, {"id": 2, "command": "measure"}])
-    )
+def test_upload_reading_posts_millimeters_and_device_timestamp():
+    opener = FakeOpener({})
+
+    assert scrapper.upload_reading("http://api:8080", READING, opener=opener) is True
+
+    request = opener.calls[0]
+    assert request.full_url == "http://api:8080/api/Device/upload"
+    assert request.get_method() == "POST"
+    assert json.loads(request.data) == {
+        "millimeters": 1.5,
+        "deviceTimestamp": "2023-07-22T04:26:40Z",
+    }
+
+
+def test_upload_reading_tolerates_trailing_slash():
+    opener = FakeOpener({})
+
+    scrapper.upload_reading("http://api:8080/", READING, opener=opener)
+
+    assert opener.urls == ["http://api:8080/api/Device/upload"]
+
+
+def test_upload_reading_returns_false_on_api_error():
+    def broken(request, timeout=None):
+        raise OSError("connection refused")
+
+    assert scrapper.upload_reading("http://api:8080", READING, opener=broken) is False
+
+
+def test_poll_commands_sends_clean_command_when_pending():
+    opener = FakeOpener({"isPending": True}, {"cleanNow": True})
     radio = FakeRadio()
 
-    assert scrapper.poll_commands(radio, commands_path, state_path, "sensor1") == 2
-    assert radio.sent == [("sensor1;reset\n", 0), ("sensor1;measure\n", 0)]
-    assert scrapper.load_state(state_path) == {"sent_ids": [1, 2]}
+    assert scrapper.poll_commands(radio, "http://api:8080", "sensor1", opener=opener) == 1
 
-    assert scrapper.poll_commands(radio, commands_path, state_path, "sensor1") == 0
-    assert len(radio.sent) == 2
+    assert radio.sent == [("sensor1;c\n", 0)]
+    assert opener.urls == [
+        "http://api:8080/api/Device/clean-status",
+        "http://api:8080/api/Device/commands",
+    ]
+
+
+def test_poll_commands_does_nothing_when_no_clean_is_pending():
+    opener = FakeOpener({"isPending": False})
+    radio = FakeRadio()
+
+    assert scrapper.poll_commands(radio, "http://api:8080", "sensor1", opener=opener) == 0
+
+    assert radio.sent == []
+    assert len(opener.calls) == 1
+
+
+def test_poll_commands_keeps_request_pending_when_mesh_send_fails():
+    class BrokenRadio:
+        def sendText(self, text, channelIndex=0):
+            raise OSError("radio offline")
+
+    opener = FakeOpener({"isPending": True})
+
+    assert scrapper.poll_commands(BrokenRadio(), "http://api:8080", "sensor1", opener=opener) == 0
+
+    assert len(opener.calls) == 1
+
+
+def test_poll_commands_tolerates_api_error():
+    def broken(url, timeout=None):
+        raise OSError("connection refused")
+
+    radio = FakeRadio()
+
+    assert scrapper.poll_commands(radio, "http://api:8080", "sensor1", opener=broken) == 0
+
+    assert radio.sent == []
 
 
 def test_receive_appends_reading_with_mesh_time(tmp_path):
@@ -154,6 +224,68 @@ def test_receive_appends_reading_with_mesh_time(tmp_path):
         "packet_id": 7,
         "text": "sensor1: 3;1.5",
     }
+
+
+def test_receive_uploads_reading_to_api(tmp_path, monkeypatch):
+    uploaded = []
+    monkeypatch.setattr(
+        scrapper,
+        "upload_reading",
+        lambda api_url, record: uploaded.append((api_url, record)),
+    )
+    packet = {"from": 1, "id": 2, "rxTime": 1690000000, "decoded": {"text": "sensor1: 3;1.5"}}
+
+    scrapper.on_receive(
+        packet,
+        None,
+        readings_path=tmp_path / "readings.jsonl",
+        messages_path=tmp_path / "messages.jsonl",
+        seen=scrapper.SeenPackets(),
+        api_url="http://api:8080",
+    )
+
+    assert uploaded == [("http://api:8080", READING)]
+
+
+def test_receive_does_not_upload_without_api_url(tmp_path, monkeypatch):
+    uploaded = []
+    monkeypatch.setattr(
+        scrapper,
+        "upload_reading",
+        lambda api_url, record: uploaded.append((api_url, record)),
+    )
+    packet = {"from": 1, "id": 2, "rxTime": 1690000000, "decoded": {"text": "sensor1: 3;1.5"}}
+
+    scrapper.on_receive(
+        packet,
+        None,
+        readings_path=tmp_path / "readings.jsonl",
+        messages_path=tmp_path / "messages.jsonl",
+        seen=scrapper.SeenPackets(),
+    )
+
+    assert uploaded == []
+
+
+def test_receive_does_not_upload_messages_that_are_not_readings(tmp_path, monkeypatch):
+    uploaded = []
+    monkeypatch.setattr(
+        scrapper,
+        "upload_reading",
+        lambda api_url, record: uploaded.append((api_url, record)),
+    )
+    packet = {"from": 9, "id": 8, "rxTime": 1690000000, "decoded": {"text": "sensor1;123"}}
+
+    scrapper.on_receive(
+        packet,
+        None,
+        readings_path=tmp_path / "readings.jsonl",
+        messages_path=tmp_path / "messages.jsonl",
+        seen=scrapper.SeenPackets(),
+        api_url="http://api:8080",
+    )
+
+    assert uploaded == []
 
 
 def test_receive_saves_message_that_is_not_a_reading(tmp_path):
@@ -218,26 +350,24 @@ class FakeStop:
         self.calls += 1
 
 
-def test_serve_sends_commands_while_radio_is_connected(tmp_path):
-    commands_path = tmp_path / "commands.json"
-    state_path = tmp_path / "state.json"
-    commands_path.write_text(json.dumps([{"id": 1, "command": "reset"}]))
+def test_serve_polls_api_while_radio_is_connected(monkeypatch):
+    calls = []
+    monkeypatch.setattr(scrapper, "poll_commands", lambda *args: calls.append(args))
     radio = FakeRadio()
 
     scrapper.serve(
         radio,
-        commands_path=commands_path,
-        state_path=state_path,
+        api_url="http://api:8080",
         sensor="sensor1",
         channel=0,
         poll_interval=0,
         stop_event=FakeStop(),
     )
 
-    assert radio.sent == [("sensor1;reset\n", 0)]
+    assert calls == [(radio, "http://api:8080", "sensor1", 0)]
 
 
-def test_serve_stops_when_radio_disconnects(tmp_path):
+def test_serve_stops_when_radio_disconnects(monkeypatch):
     class FakeState:
         def __init__(self, connected):
             self.connected = connected
@@ -245,23 +375,21 @@ def test_serve_stops_when_radio_disconnects(tmp_path):
         def is_set(self):
             return self.connected
 
-    commands_path = tmp_path / "commands.json"
-    state_path = tmp_path / "state.json"
-    commands_path.write_text(json.dumps([{"id": 1, "command": "reset"}]))
+    calls = []
+    monkeypatch.setattr(scrapper, "poll_commands", lambda *args: calls.append(args))
     radio = FakeRadio()
     radio.isConnected = FakeState(False)
 
     scrapper.serve(
         radio,
-        commands_path=commands_path,
-        state_path=state_path,
+        api_url="http://api:8080",
         sensor="sensor1",
         channel=0,
         poll_interval=0,
         stop_event=FakeStop(after=1),
     )
 
-    assert radio.sent == []
+    assert calls == []
 
 
 def test_pubsub_handler_delivers_packet(tmp_path):
