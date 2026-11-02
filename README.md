@@ -7,9 +7,9 @@ Skrypt działa w jednej pętli i robi dwie rzeczy:
 
 1. **Mesh → pliki i API** — nasłuchuje tekstowych wiadomości z mesha. Każdą
    odebraną wiadomość zapisuje w `messages.jsonl`, a dodatkowo te w formacie
-   `sensor1: <przechylenia>;<mm>` trafiają jako odczyt do `readings.jsonl`
-   oraz przez `POST /api/Device/upload` do API. Czas bierze z metadanych
-   pakietu (`rxTime`), nie z treści.
+   `sensor1;<mm>` lub `sensor1: <przechylenia>;<mm>` trafiają jako odczyt do
+   `readings.jsonl` oraz przez `POST /api/Device/upload` do API. Czas bierze
+   z metadanych pakietu (`rxTime`), nie z treści.
 2. **API → mesh** — co kilka sekund pyta `GET /api/Device/clean-status`.
    Gdy czyszczenie jest oczekujące, wysyła na kanał główny `sensor1;c\n`,
    a po udanej wysyłce odbiera komendę przez `GET /api/Device/commands`.
@@ -71,7 +71,7 @@ radia skrypt próbuje połączyć się ponownie.
 Każda odebrana wiadomość tekstowa, niezależnie od treści:
 
 ```json
-{"timestamp": "2026-10-30T12:34:56Z", "from": "!28b54624", "channel": 0, "packet_id": 589440320, "text": "sensor1;123"}
+{"timestamp": "2026-10-30T12:34:56Z", "from": "!28b54624", "channel": 0, "packet_id": 589440320, "text": "sensor1;9"}
 ```
 
 `from` to ID węzła (`fromId`), a gdy go brakuje — numer węzła. Duplikaty tego
@@ -79,12 +79,20 @@ samego pakietu są pomijane.
 
 ### Odczyty — `readings.jsonl`
 
-Tylko wiadomości pasujące do `sensor1: <liczba>;<mm>`. Jedna linia = jeden
-odczyt, który jest też wysyłany do API:
+Akceptowane są dwa formaty:
+
+- `sensor1;9` — tylko milimetry (tak wysyła urządzenie),
+- `sensor1: 1234;20` — liczba przechyleń i milimetry (starszy format).
+
+Jedna linia = jeden odczyt, który jest też wysyłany do API:
 
 ```json
+{"timestamp": "2026-10-30T12:34:56Z", "sensor": "sensor1", "tilts": null, "rain_mm": 9.0}
 {"timestamp": "2026-10-30T12:34:56Z", "sensor": "sensor1", "tilts": 1234, "rain_mm": 20.0}
 ```
+
+Dla formatu bez przechyleń `tilts` ma wartość `null`. Do API trafia tylko
+`rain_mm` jako `millimeters`.
 
 `timestamp` pochodzi z `rxTime` pakietu (zegar radia odbiorczego). Jeśli pakiet
 go nie ma, używany jest zegar Raspberry Pi.
