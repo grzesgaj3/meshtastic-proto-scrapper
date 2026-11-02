@@ -11,6 +11,22 @@ def test_parses_reading():
     }
 
 
+def test_parses_reading_without_tilts():
+    assert scrapper.parse_reading("sensor1;9") == {
+        "sensor": "sensor1",
+        "tilts": None,
+        "rain_mm": 9.0,
+    }
+
+
+def test_parses_reading_without_tilts_tolerates_whitespace():
+    assert scrapper.parse_reading("  sensor1 ; 20.5 \n") == {
+        "sensor": "sensor1",
+        "tilts": None,
+        "rain_mm": 20.5,
+    }
+
+
 def test_tolerates_whitespace_and_trailing_newline():
     assert scrapper.parse_reading("  sensor1 :  1234 ; 20.5 \n") == {
         "sensor": "sensor1",
@@ -28,6 +44,7 @@ def test_rejects_malformed_messages():
         "sensor1: -1;2.0",
         "sensor1: 1;2;3",
         "sensor1 1;2",
+        "sensor1;c",
     ]
     for text in malformed:
         assert scrapper.parse_reading(text) is None, text
@@ -38,6 +55,15 @@ def test_builds_record_with_time_from_mesh_packet():
         "timestamp": "2023-07-22T04:26:40Z",
         "sensor": "sensor1",
         "tilts": 1234,
+        "rain_mm": 20.0,
+    }
+
+
+def test_builds_record_without_tilts():
+    assert scrapper.build_record("sensor1;20", rx_time=1690000000) == {
+        "timestamp": "2023-07-22T04:26:40Z",
+        "sensor": "sensor1",
+        "tilts": None,
         "rain_mm": 20.0,
     }
 
@@ -267,6 +293,52 @@ def test_receive_does_not_upload_without_api_url(tmp_path, monkeypatch):
     assert uploaded == []
 
 
+def test_receive_uploads_reading_without_tilts(tmp_path, monkeypatch):
+    uploaded = []
+    monkeypatch.setattr(
+        scrapper,
+        "upload_reading",
+        lambda api_url, record: uploaded.append((api_url, record)),
+    )
+    packet = {"from": 9, "id": 8, "rxTime": 1690000000, "decoded": {"text": "sensor1;9"}}
+
+    scrapper.on_receive(
+        packet,
+        None,
+        readings_path=tmp_path / "readings.jsonl",
+        messages_path=tmp_path / "messages.jsonl",
+        seen=scrapper.SeenPackets(),
+        api_url="http://api:8080",
+    )
+
+    assert uploaded == [
+        (
+            "http://api:8080",
+            {
+                "timestamp": "2023-07-22T04:26:40Z",
+                "sensor": "sensor1",
+                "tilts": None,
+                "rain_mm": 9.0,
+            },
+        )
+    ]
+
+
+def test_receive_logs_every_message(tmp_path, caplog):
+    packet = {"from": 9, "id": 8, "rxTime": 1690000000, "decoded": {"text": "sensor1;10"}}
+
+    with caplog.at_level("INFO", logger="scrapper"):
+        scrapper.on_receive(
+            packet,
+            None,
+            readings_path=tmp_path / "readings.jsonl",
+            messages_path=tmp_path / "messages.jsonl",
+            seen=scrapper.SeenPackets(),
+        )
+
+    assert "sensor1;10" in caplog.text
+
+
 def test_receive_does_not_upload_messages_that_are_not_readings(tmp_path, monkeypatch):
     uploaded = []
     monkeypatch.setattr(
@@ -274,7 +346,7 @@ def test_receive_does_not_upload_messages_that_are_not_readings(tmp_path, monkey
         "upload_reading",
         lambda api_url, record: uploaded.append((api_url, record)),
     )
-    packet = {"from": 9, "id": 8, "rxTime": 1690000000, "decoded": {"text": "sensor1;123"}}
+    packet = {"from": 9, "id": 8, "rxTime": 1690000000, "decoded": {"text": "sensor1;c"}}
 
     scrapper.on_receive(
         packet,
@@ -291,7 +363,7 @@ def test_receive_does_not_upload_messages_that_are_not_readings(tmp_path, monkey
 def test_receive_saves_message_that_is_not_a_reading(tmp_path):
     readings = tmp_path / "readings.jsonl"
     messages = tmp_path / "messages.jsonl"
-    packet = {"from": 9, "id": 8, "rxTime": 1690000000, "decoded": {"text": "sensor1;123"}}
+    packet = {"from": 9, "id": 8, "rxTime": 1690000000, "decoded": {"text": "sensor1;c"}}
 
     scrapper.on_receive(
         packet,
@@ -302,7 +374,7 @@ def test_receive_saves_message_that_is_not_a_reading(tmp_path):
     )
 
     saved = json.loads(messages.read_text())
-    assert saved["text"] == "sensor1;123"
+    assert saved["text"] == "sensor1;c"
     assert saved["from"] == 9
     assert saved["channel"] == 0
     assert not readings.exists()

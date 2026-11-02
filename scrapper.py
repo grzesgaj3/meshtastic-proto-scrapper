@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 READING_RE = re.compile(r"^\s*([^:;]+?)\s*:\s*(\d+)\s*;\s*(\d+(?:\.\d+)?)\s*$")
+READING_NO_TILTS_RE = re.compile(r"^\s*([^:;\s]+)\s*;\s*(\d+(?:\.\d+)?)\s*$")
 
 API_TIMEOUT = 5
 CLEAN_COMMAND = "c"
@@ -21,15 +22,23 @@ log = logging.getLogger("scrapper")
 
 
 def parse_reading(text):
-    """Parse ``sensor1: 1234;20`` into a dict with sensor name, tilts and mm."""
-    match = READING_RE.match(text or "")
-    if match is None:
-        return None
-    return {
-        "sensor": match.group(1),
-        "tilts": int(match.group(2)),
-        "rain_mm": float(match.group(3)),
-    }
+    """Parse ``sensor1: 1234;20`` or ``sensor1;20`` (no tilt count)."""
+    text = text or ""
+    match = READING_RE.match(text)
+    if match is not None:
+        return {
+            "sensor": match.group(1),
+            "tilts": int(match.group(2)),
+            "rain_mm": float(match.group(3)),
+        }
+    match = READING_NO_TILTS_RE.match(text)
+    if match is not None:
+        return {
+            "sensor": match.group(1),
+            "tilts": None,
+            "rain_mm": float(match.group(2)),
+        }
+    return None
 
 
 def iso_utc(epoch):
@@ -155,22 +164,38 @@ def on_receive(packet, interface=None, *, readings_path, messages_path, seen, ap
         log.debug("Pomijam duplikat pakietu id=%s", key[1])
         return
 
+    log.info(
+        "Odebrano wiadomość od %s: %r",
+        packet.get("fromId", packet.get("from")),
+        text,
+    )
     append_record(messages_path, build_message(packet, text))
 
     record = build_record(text, packet.get("rxTime"))
     if record is None:
-        log.debug("Zapisano wiadomość bez odczytu: %r", text)
+        log.info(
+            "Zapisano wiadomość bez odczytu: %r "
+            "(oczekiwany format 'sensor: przechylenia;mm' lub 'sensor;mm')",
+            text,
+        )
         return
 
     append_record(readings_path, record)
     if api_url:
         upload_reading(api_url, record)
-    log.info(
-        "Odczyt: %s przechyleń, %.1f mm (pakiet id=%s)",
-        record["tilts"],
-        record["rain_mm"],
-        key[1],
-    )
+    if record["tilts"] is None:
+        log.info(
+            "Odczyt: %.1f mm bez przechyleń (pakiet id=%s)",
+            record["rain_mm"],
+            key[1],
+        )
+    else:
+        log.info(
+            "Odczyt: %s przechyleń, %.1f mm (pakiet id=%s)",
+            record["tilts"],
+            record["rain_mm"],
+            key[1],
+        )
 
 
 def make_handler(readings_path, messages_path, seen, api_url=None):
